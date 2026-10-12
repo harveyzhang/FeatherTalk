@@ -27,6 +27,9 @@ struct Args {
   int iterations = 300;
   int warmup = 50;
   int threads = 4;
+  int offline_seconds = 20;
+  int audio_iterations = 5;
+  int audio_warmup = 1;
   bool module_profile = false;
 };
 
@@ -42,6 +45,9 @@ void Usage() {
       << "  --iterations N                 Timed iterations (default: 300)\n"
       << "  --warmup N                     Warmup iterations (default: 50)\n"
       << "  --threads N                    CPU thread count (default: 4)\n"
+      << "  --offline-seconds N            Whole-waveform audio duration (default: 20)\n"
+      << "  --audio-iterations N           Whole-waveform timed iterations (default: 5)\n"
+      << "  --audio-warmup N               Whole-waveform warmup iterations (default: 1)\n"
       << "  --module-profile               Aggregate MNN operator time by UNet module\n";
 }
 
@@ -68,6 +74,9 @@ Args ParseArgs(int argc, char** argv) {
     else if (key == "--iterations") args.iterations = std::stoi(value);
     else if (key == "--warmup") args.warmup = std::stoi(value);
     else if (key == "--threads") args.threads = std::stoi(value);
+    else if (key == "--offline-seconds") args.offline_seconds = std::stoi(value);
+    else if (key == "--audio-iterations") args.audio_iterations = std::stoi(value);
+    else if (key == "--audio-warmup") args.audio_warmup = std::stoi(value);
     else throw std::runtime_error("Unknown option: " + key);
   }
   if (args.feather_model.empty() || args.unet_model.empty()) {
@@ -81,7 +90,9 @@ Args ParseArgs(int argc, char** argv) {
   if (args.precision != "high" && args.precision != "normal" && args.precision != "low") {
     throw std::runtime_error("--precision must be high, normal, or low.");
   }
-  if (args.iterations <= 0 || args.warmup < 0 || args.threads <= 0) {
+  if (args.iterations <= 0 || args.warmup < 0 || args.threads <= 0 ||
+      args.audio_iterations <= 0 || args.audio_warmup < 0 ||
+      args.offline_seconds <= 0 || args.offline_seconds > 3600) {
     throw std::runtime_error("Invalid numeric option.");
   }
   return args;
@@ -180,7 +191,11 @@ class Model {
 
   void FinalizeShapes() {
     interpreter_->resizeSession(session_);
+    // Audio benchmarking changes waveform length; never reuse an old output buffer.
+    host_output_.reset();
   }
+
+  std::vector<int> OutputShape() const { return output_->shape(); }
 
   void Run() {
     if (host_inputs_.size() != inputs_.size()) throw std::runtime_error("All MNN inputs must be bound.");
@@ -361,16 +376,20 @@ Stats Measure(const std::string& label, int warmup, int iterations, Callable&& c
 
 void BenchmarkBackend(const Args& args, const BackendSpec& backend) {
   constexpr int face_size = 144;
+  constexpr int sample_rate = 16000;
+  constexpr int feature_dim = 1024;
+  // 20 video-frame steps = 800 ms. The valid-convolution frontend needs an
+  // additional 80 samples (5 ms) to produce all 40 HuBERT-compatible tokens.
+  constexpr int window_samples = sample_rate * 800 / 1000 + 80;
   const auto precision = ParsePrecision(args.precision);
   Model feather(args.feather_model, backend, args.threads, precision, {"waveform"}, "hidden");
   Model unet(args.unet_model, backend, args.threads, precision, {"input", "audio"}, "output");
 
-  // Two 20 ms HuBERT tokens are one 25 fps video-frame feature.
-  auto waveform = MakeSignal(720, 0.0F);
+  auto window_waveform = MakeSignal(window_samples, 0.0F);
   auto image = MakeSignal(6 * face_size * face_size, 0.1F);
   const std::vector<int> audio_shape = {1, 40, 1024};
   auto audio = MakeSignal(40 * 1024, 0.2F);
-  feather.BindFloatInput(0, {1, 720}, waveform.data());
+  feather.BindFloatInput(0, {1, window_samples}, window_waveform.data());
   feather.FinalizeShapes();
   unet.BindFloatInput(0, {1, 6, face_size, face_size}, image.data());
   unet.BindFloatInput(1, audio_shape, audio.data());
@@ -379,10 +398,14 @@ void BenchmarkBackend(const Args& args, const BackendSpec& backend) {
   // Allocate output host tensors and let GPU runtimes finish their first pipeline setup before timing.
   feather.Run();
   unet.Run();
+  if (feather.OutputShape() != std::vector<int>({1, 40, feature_dim})) {
+    throw std::runtime_error("800 ms audio window must produce [1,40,1024].");
+  }
   std::cout << backend.name << " (face=" << face_size << ", precision=" << args.precision
             << ", threads=" << args.threads << ")\n";
-  const Stats feather_stats = Measure("FeatherHuBERT [1,720] -> [1,2,1024]", args.warmup,
-                                      args.iterations, [&] { feather.Run(); });
+  const Stats window_stats = Measure(
+      "FeatherHuBERT 800 ms context + 5 ms frontend tail [1,12880] -> [1,40,1024]",
+      args.warmup, args.iterations, [&] { feather.Run(); });
   const Stats unet_stats = Measure("UNet one video frame", args.warmup, args.iterations,
                                    [&] { unet.Run(); });
   if (args.module_profile && backend.forward == MNN_FORWARD_CPU) {
@@ -391,9 +414,35 @@ void BenchmarkBackend(const Args& args, const BackendSpec& backend) {
         args.iterations,
         unet_stats.mean);
   }
-  const double combined = feather_stats.mean + unet_stats.mean;
-  std::cout << "  Combined model mean: " << combined << " ms/frame (" << 1000.0 / combined
-            << " model-only fps)\n";
+  const int offline_samples = sample_rate * args.offline_seconds;
+  auto offline_waveform = MakeSignal(static_cast<size_t>(offline_samples), 0.0F);
+  feather.BindFloatInput(0, {1, offline_samples}, offline_waveform.data());
+  feather.FinalizeShapes();
+  feather.Run();
+  const auto offline_shape = feather.OutputShape();
+  const int expected_tokens = (offline_samples - 80) / 320;
+  if (offline_shape != std::vector<int>({1, expected_tokens, feature_dim})) {
+    throw std::runtime_error("Whole-waveform audio output does not match HuBERT token count.");
+  }
+  // Match the offline runner: discard an odd last token, then pair tokens.
+  const int offline_frames = offline_shape[1] / 2;
+  const Stats offline_stats = Measure(
+      "FeatherHuBERT whole " + std::to_string(args.offline_seconds) + " s waveform (" +
+          std::to_string(offline_frames) + " usable video frames)",
+      args.audio_warmup, args.audio_iterations, [&] { feather.Run(); });
+  const double audio_per_frame = offline_stats.mean / offline_frames;
+  const double offline_combined = audio_per_frame + unet_stats.mean;
+  const double window_combined = window_stats.mean + unet_stats.mean;
+  std::cout << std::fixed << std::setprecision(3)
+            << "  Offline audio amortized: " << audio_per_frame << " ms/video frame\n"
+            << "  Offline amortized model total: " << offline_combined << " ms/frame ("
+            << 1000.0 / offline_combined << " model-only fps)\n"
+            << "  Recompute 800 ms window for every 40 ms video frame: "
+            << window_combined << " ms/frame (" << 1000.0 / window_combined
+            << " model-only fps)\n"
+            << "  Model-only timings include tensor transfers; exclude normalization, "
+               "I/O, compositing, encoding and look-ahead latency.\n"
+            << "  Window recompute is a cost scenario, not an implemented streaming pipeline.\n";
 
 }
 

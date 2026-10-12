@@ -17,7 +17,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset_mouth_roi import MouthRoiConfig, TemporalMouthRoiDataset
-from model import IMAGE_SIZE, Model, load_checkpoint_state
+from model import (
+    IMAGE_SIZE, MODEL_TYPES, create_model, load_checkpoint_state,
+    load_visual_model, visual_model_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset_dir", type=str, required=True)
     parser.add_argument("--save_dir", type=str, required=True)
+    parser.add_argument(
+        "--model", choices=MODEL_TYPES, default=None,
+        help="visual architecture; defaults to feathertalk, or resume checkpoint metadata",
+    )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batchsize", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -123,7 +130,10 @@ def save_checkpoint(
     path: str, model: nn.Module, optimizer: optim.Optimizer, epoch: int
 ) -> None:
     torch.save(
-        {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict()},
+        {
+            "epoch": epoch, "model": model.state_dict(),
+            "model_config": visual_model_config(model), "optimizer": optimizer.state_dict(),
+        },
         path,
     )
 
@@ -346,6 +356,15 @@ def main():
     if args.see_res:
         os.makedirs(args.see_res_dir, exist_ok=True)
 
+    if args.resume:
+        net = load_visual_model(args.resume, device, model_type=args.model or "auto")
+        if visual_model_config(net)["reparameterized"]:
+            raise ValueError("Resume training from an unfused checkpoint, not deployment weights")
+    else:
+        net = create_model(args.model or "feathertalk").to(device)
+    if net.image_size != IMAGE_SIZE:
+        raise ValueError(f"The training pipeline requires {IMAGE_SIZE}x{IMAGE_SIZE} images")
+
     mouth_config = MouthRoiConfig(
         start=args.mouth_start,
         end=args.mouth_end,
@@ -359,6 +378,8 @@ def main():
         mouth_config=mouth_config,
         temporal_stride=args.temporal_stride,
         image_size=IMAGE_SIZE,
+        audio_half_window=net.audio_half_window,
+        raw_hubert_audio=net.raw_hubert_audio,
     )
     loader = DataLoader(
         dataset,
@@ -368,7 +389,6 @@ def main():
         num_workers=args.num_workers,
     )
 
-    net = Model().to(device)
     optimizer = optim.Adam(net.parameters(), lr=args.lr)
     pixel_criterion = nn.L1Loss()
     perceptual_loss = PerceptualLoss(nn.MSELoss(), device=device)

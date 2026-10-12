@@ -15,7 +15,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from data_utils.feather_hubert.feather_hubert import load_feather_hubert
-from model import AUDIO_FEATURE_DIM, AUDIO_TOKENS, IMAGE_SIZE, Model, load_checkpoint_state
+from model import (
+    AUDIO_FEATURE_DIM, AUDIO_TOKENS, IMAGE_SIZE, MODEL_TYPES,
+    load_visual_model, visual_export_model,
+)
 
 
 def export_feather(checkpoint: Path, output: Path, opset: int) -> None:
@@ -36,9 +39,13 @@ def export_feather(checkpoint: Path, output: Path, opset: int) -> None:
     print(f"[export] FeatherHuBERT -> {output}")
 
 
-def export_visual(checkpoint: Path, output: Path, opset: int) -> None:
-    model = Model().eval()
-    model.load_state_dict(load_checkpoint_state(str(checkpoint)))
+def export_visual(
+    checkpoint: Path, output: Path, opset: int, model_type: str = "auto"
+) -> None:
+    native_model = load_visual_model(str(checkpoint), model_type=model_type, reparameterize=True)
+    if native_model.image_size != IMAGE_SIZE:
+        raise ValueError(f"The C++ export interface requires {IMAGE_SIZE}x{IMAGE_SIZE} images")
+    model = visual_export_model(native_model)
     image = torch.zeros((1, 6, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32)
     audio = torch.zeros((1, AUDIO_TOKENS, AUDIO_FEATURE_DIM), dtype=torch.float32)
     torch.onnx.export(
@@ -52,13 +59,14 @@ def export_visual(checkpoint: Path, output: Path, opset: int) -> None:
         dynamo=False,
     )
     onnx.checker.check_model(str(output))
-    print(f"[export] FeatherTalk visual model -> {output}")
+    print(f"[export] {native_model.model_type} visual model -> {output}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--feather-checkpoint", type=Path, required=True)
     parser.add_argument("--visual-checkpoint", type=Path, required=True)
+    parser.add_argument("--model", choices=("auto", *MODEL_TYPES), default="auto")
     parser.add_argument(
         "--output-dir", type=Path, default=ROOT / "FeatherTalk-CPP" / "models"
     )
@@ -70,7 +78,7 @@ def main() -> None:
         args.feather_checkpoint, args.output_dir / "feather_hubert.onnx", args.opset
     )
     export_visual(
-        args.visual_checkpoint, args.output_dir / "feathertalk_144.onnx", args.opset
+        args.visual_checkpoint, args.output_dir / "feathertalk_144.onnx", args.opset, args.model
     )
 
 

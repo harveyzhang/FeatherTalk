@@ -155,11 +155,15 @@ def reshape_audio_feat(
     mode: str = "hubert",
     raw_hubert: bool = True,
 ) -> torch.Tensor:
-    """Convert 20 video-frame features into ``[40, 1024]`` tokens."""
-    if mode != "hubert" or not raw_hubert:
+    """Convert HuBERT features to raw tokens or the legacy MobileOne layout."""
+    if mode != "hubert":
         raise ValueError("FeatherTalk requires HuBERT-compatible raw features")
     if audio_feat.ndim != 3 or audio_feat.shape[-2:] != (2, 1024):
         raise ValueError("audio features must have shape [frames, 2, 1024]")
+    if not raw_hubert:
+        if audio_feat.shape[0] != 8:
+            raise ValueError("MobileOne requires exactly 8 video-frame audio features")
+        return audio_feat.reshape(16, 32, 32).contiguous()
     return audio_feat.reshape(-1, 1024).contiguous()
 
 

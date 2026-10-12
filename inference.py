@@ -24,7 +24,7 @@ from face_utils import (
     read_landmarks,
     reshape_audio_feat,
 )
-from model import Model, load_checkpoint_state
+from model import IMAGE_SIZE, MODEL_TYPES, load_visual_model
 
 
 OUTPUT_FPS = 25
@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--audio_feat", required=True, help="aud_hu.npy")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--model", choices=("auto", *MODEL_TYPES), default="auto")
     parser.add_argument("--save_path", required=True)
     parser.add_argument(
         "--audio_wav", default="", help="optional WAV merged into the output video"
@@ -45,10 +46,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> Model:
-    model = Model().to(device)
-    model.load_state_dict(load_checkpoint_state(checkpoint_path, device))
-    return model.eval()
+def load_model(
+    checkpoint_path: str, device: torch.device, model_type: str = "auto"
+) -> torch.nn.Module:
+    model = load_visual_model(checkpoint_path, device, model_type, reparameterize=True)
+    if model.image_size != IMAGE_SIZE:
+        raise ValueError(f"The inference pipeline requires {IMAGE_SIZE}x{IMAGE_SIZE} images")
+    return model
 
 
 def select_fourcc(path: str) -> int:
@@ -156,7 +160,7 @@ def run(args: argparse.Namespace, device: torch.device | None = None) -> None:
         temporary_video, select_fourcc(temporary_video), OUTPUT_FPS, (width, height)
     )
 
-    model = load_model(args.checkpoint, device)
+    model = load_model(args.checkpoint, device, getattr(args, "model", "auto"))
     picker = FramePicker(frame_count)
     with torch.no_grad():
         for frame_index in range(features.shape[0]):
@@ -167,7 +171,8 @@ def run(args: argparse.Namespace, device: torch.device | None = None) -> None:
                 image, landmark_path, device
             )
             audio = reshape_audio_feat(
-                gather_audio_window(features, frame_index)
+                gather_audio_window(features, frame_index, half_window=model.audio_half_window),
+                raw_hubert=model.raw_hubert_audio,
             ).unsqueeze(0).to(device)
             prediction = model(model_input, audio)[0]
             prediction = (

@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from face_utils import (
+    AUDIO_HALF_WINDOW,
     FACE_BORDER,
     FACE_INNER_SIZE,
     GEOMETRY_BASE_SIZE,
@@ -141,12 +142,16 @@ class MouthRoiDataset(Dataset):
         dataset_dir: str,
         mouth_config: MouthRoiConfig | None = None,
         image_size: int = FACE_INNER_SIZE,
+        audio_half_window: int = AUDIO_HALF_WINDOW,
+        raw_hubert_audio: bool = True,
     ):
         self.mouth_config = mouth_config or MouthRoiConfig()
         if image_size != FACE_INNER_SIZE:
             raise ValueError(f"image_size must be {FACE_INNER_SIZE}")
         self.image_size = image_size
         self.crop_size = image_size + 2 * FACE_BORDER
+        self.audio_half_window = audio_half_window
+        self.raw_hubert_audio = raw_hubert_audio
 
         full_body_dir = os.path.join(dataset_dir, "full_body_img")
         landmarks_dir = os.path.join(dataset_dir, "landmarks")
@@ -205,10 +210,11 @@ class MouthRoiDataset(Dataset):
         audio_feat = gather_audio_window(
             self.audio_feats,
             idx,
+            half_window=self.audio_half_window,
             valid_start=int(self.clip_starts[idx]),
             valid_end=int(self.clip_ends[idx]),
         )
-        audio_feat = reshape_audio_feat(audio_feat)
+        audio_feat = reshape_audio_feat(audio_feat, raw_hubert=self.raw_hubert_audio)
         return img_concat_T, target_T, audio_feat, mouth_mask_T
 
     def __getitem__(self, idx: int):
@@ -228,11 +234,15 @@ class TemporalMouthRoiDataset(MouthRoiDataset):
         mouth_config: MouthRoiConfig | None = None,
         temporal_stride: int = 1,
         image_size: int = FACE_INNER_SIZE,
+        audio_half_window: int = AUDIO_HALF_WINDOW,
+        raw_hubert_audio: bool = True,
     ):
         super().__init__(
             dataset_dir,
             mouth_config=mouth_config,
             image_size=image_size,
+            audio_half_window=audio_half_window,
+            raw_hubert_audio=raw_hubert_audio,
         )
         if temporal_stride < 1:
             raise ValueError("temporal_stride must be >= 1")

@@ -2,8 +2,8 @@
 
 # FeatherTalk C++ / MNN
 
-This directory contains the standalone C++ inference path for the released
-FeatherTalk model. Runtime inference depends on MNN and FFmpeg, but not Python,
+This directory contains standalone, offline C++ inference for FeatherTalk and
+MobileOne visual models. Runtime inference depends on MNN and FFmpeg, but not Python,
 PyTorch, OpenCV or ONNX Runtime.
 
 ## Fixed model interface
@@ -13,7 +13,7 @@ FeatherHuBERT
   waveform: [1, samples]
   hidden:   [1, tokens, 1024]
 
-FeatherTalk visual model
+Visual model (FeatherTalk or exported MobileOne)
   input:  [1, 6, 144, 144]
   audio:  [1, 40, 1024]
   output: [1, 3, 144, 144]
@@ -23,6 +23,13 @@ The runner extracts audio features once for the complete WAV. Each video frame
 uses the corresponding 40-token slice. The generated 144x144 patch directly
 replaces the inner face region.
 
+Both FeatherTalk and MobileOne export this same interface. MobileOne is fused
+automatically during export; its input adapter selects the central 8 video-frame
+steps (16 tokens) from the common 20-step window and reshapes them for its legacy
+audio branch. The C++ runner therefore needs no architecture-specific changes.
+Native Python MobileOne uses `[B,16,32,32]` audio, but exported ONNX/MNN models
+always use the public `[1,40,1024]` interface shown above.
+
 ## Export and convert models
 
 From the repository root:
@@ -30,7 +37,8 @@ From the repository root:
 ```bash
 python FeatherTalk-CPP/tools/export_models.py \
   --feather-checkpoint ./feather_hubert.pth \
-  --visual-checkpoint /path/to/visual_model.pth
+  --visual-checkpoint /path/to/visual_model.pth \
+  --model auto
 
 cd FeatherTalk-CPP
 ./setup_mnn_macos.sh
@@ -45,6 +53,16 @@ models/feathertalk_144_fp16.mnn
 ```
 
 ONNX is used only as an offline conversion format.
+The visual architecture is detected from checkpoint metadata or legacy weights
+for these two HuBERT-compatible architectures.
+Optionally pass `--model feathertalk` or `--model mobileone` to the exporter to
+verify the selected architecture; a mismatch is an error. MobileOne is
+reparameterized automatically, without modifying the source checkpoint.
+Continue training from that original, unfused checkpoint.
+
+The output filenames remain the same for both architectures. Exporting another
+model into the same directory replaces the previous exported files; keep separate
+copies when comparing models.
 
 ## Build on Apple Silicon
 
@@ -118,8 +136,30 @@ Useful optional flags:
 ./bin/benchmark_mnn \
   --feather-model models/feather_hubert.mnn \
   --unet-model models/feathertalk_144_fp16.mnn \
-  --backend cpu --precision low --threads 1
+  --backend cpu --precision low --threads 1 \
+  --offline-seconds 20 --audio-iterations 5 --audio-warmup 1
 ```
+
+The benchmark uses synthetic inputs and reports UNet time plus two separate,
+model-only audio cost scenarios:
+
+- Offline: extract a complete 20-second waveform, then divide audio time by the
+  number of usable video frames. `--offline-seconds N` changes the duration;
+  `--audio-iterations N` / `--audio-warmup N` control this longer measurement.
+- Window recompute: extract an 800 ms audio context again for every 40 ms video
+  frame. An extra 80 samples (5 ms) are needed by the valid-convolution frontend
+  to produce all 40 tokens. This measures recompute cost, not a complete streaming
+  implementation, and does not claim feature equivalence to offline extraction.
+
+Offline total = whole-waveform audio time / usable video frames + UNet time.
+Window-recompute total = one 800 ms window extraction + one UNet inference.
+`--iterations` / `--warmup` control the UNet and window measurements; the separate
+`--audio-iterations` / `--audio-warmup` options control whole-waveform measurements.
+
+Times include input/output tensor transfers but exclude normalization, file I/O,
+compositing, video encoding and look-ahead latency. The former 720-sample timing
+is no longer used as a per-video-frame audio estimate.
+The supplied `RunOffline` API still accepts a complete WAV, not live PCM chunks.
 
 Generated models, MNN source/build trees and binaries are intentionally ignored
 by Git.
